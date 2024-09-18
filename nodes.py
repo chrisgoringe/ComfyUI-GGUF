@@ -12,6 +12,8 @@ import folder_paths
 
 from .ops import GGMLTensor, GGMLOps, move_patch_to_device
 from .dequant import is_quantized, is_torch_compatible
+from .precaster import add_precasting_to_flux_diffusion_model
+from comfy.model_base import Flux
 
 # Add a custom keys for files ending in .gguf
 if "unet_gguf" not in folder_paths.folder_names_and_paths:
@@ -228,6 +230,7 @@ class UnetLoaderGGUF:
         return {
             "required": {
                 "unet_name": (unet_names,),
+                "use_flux_precache": (["no","yes"],{})
             }
         }
 
@@ -236,7 +239,7 @@ class UnetLoaderGGUF:
     CATEGORY = "bootleg"
     TITLE = "Unet Loader (GGUF)"
 
-    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
+    def load_unet(self, unet_name, use_flux_precache="no", dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         ops = GGMLOps()
 
         if dequant_dtype in ("default", None):
@@ -262,6 +265,12 @@ class UnetLoaderGGUF:
         if model is None:
             logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
+        
+        if isinstance(model.model, Flux) and use_flux_precache=="yes":
+            add_precasting_to_flux_diffusion_model(diff_model = model.model.diffusion_model, 
+                                                   dtype      = model.model.model_config.unet_config['dtype'], 
+                                                   device     = comfy.model_management.get_torch_device())
+
         model = GGUFModelPatcher.clone(model)
         model.patch_on_device = patch_on_device
         return (model,)

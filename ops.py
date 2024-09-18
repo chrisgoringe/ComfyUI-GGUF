@@ -6,6 +6,10 @@ import comfy.ops
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
+from dataclasses import dataclass
+from typing import Union
+import threading
+
 class GGMLTensor(torch.Tensor):
     """
     Main tensor-like class for storing quantized weights
@@ -91,13 +95,21 @@ class GGMLLayer(torch.nn.Module):
             return self.ggml_save_to_state_dict(*args, **kwargs)
         return super()._save_to_state_dict(*args, **kwargs)
 
-    def ggml_save_to_state_dict(self, destination, prefix, keep_vars):
+    def ggml_save_to_state_dict(self, destination, prefix:str, keep_vars):
         # This is a fake state dict for vram estimation
-        weight = torch.zeros_like(self.weight, device=torch.device("meta"))
-        destination[prefix + "weight"] = weight
-        if self.bias is not None:
-            bias = torch.zeros_like(self.bias, device=torch.device("meta"))
-            destination[prefix + "bias"] = bias
+        if prefix.startswith('diffusion_model.double_blocks.0'):
+            # We need space to expand one layer...
+            weight = torch.zeros(size=self.weight.tensor_shape, dtype=torch.bfloat16, device=torch.device("meta"))
+            destination[prefix + "weight"] = weight
+            if self.bias is not None:
+                bias = torch.zeros(size=self.bias.tensor_shape, dtype=torch.bfloat16, device=torch.device("meta"))
+                destination[prefix + "bias"] = bias
+        else:
+            weight = torch.zeros_like(self.weight, device=torch.device("meta"))
+            destination[prefix + "weight"] = weight
+            if self.bias is not None:
+                bias = torch.zeros_like(self.bias, device=torch.device("meta"))
+                destination[prefix + "bias"] = bias
         return
 
         # This would return the actual state dict
@@ -126,9 +138,12 @@ class GGMLLayer(torch.nn.Module):
                 # for testing, may degrade image quality
                 patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
                 weight = function(patch_list, weight, key, patch_dtype)
-        return weight
+        return weight  
 
     def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None):
+        if getattr(s, '_cache', None) is not None and s._cache.weight is not None: 
+            return s._cache.weight, s._cache.bias
+        
         if input is not None:
             if dtype is None:
                 dtype = getattr(input, "dtype", torch.float32)
@@ -155,6 +170,11 @@ class GGMLLayer(torch.nn.Module):
     def forward_ggml_cast_weights(self, input):
         raise NotImplementedError
 
+@dataclass
+class WeightAndBias:
+    weight: Union[torch.Tensor, None] = None
+    bias:   Union[torch.Tensor, None] = None
+
 class GGMLOps(comfy.ops.manual_cast):
     """
     Dequantize weights on the fly before doing the compute
@@ -168,7 +188,30 @@ class GGMLOps(comfy.ops.manual_cast):
             self.in_features = in_features
             self.out_features = out_features
             self.weight = None
-            self.bias = None
+            self.bias   = None
+            self._cache = None
+            self.use_cache = False
+        
+        def dump_cache(self):
+            if self._cache is not None:
+                if self._cache.weight is not None:
+                    self._cache.weight.to(comfy.model_management.unet_offload_device())
+                if self._cache.bias is not None:
+                    self._cache.bias.to(comfy.model_management.unet_offload_device())
+            self._cache = None
+
+        def prep_cache(self, *args, **kwargs):
+            if self.weight is None or not self.use_cache: return
+            self._cache = WeightAndBias()
+            def _prep_cache():
+                self._cache.weight, self._cache.bias = self.cast_bias_weight(*args, **kwargs)
+            threading.Thread(target=_prep_cache).start()
+
+        def cast_bias_weight(s, *args, **kwargs):
+            if s._cache is not None and s._cache.weight is not None: 
+                return s._cache.weight, s._cache.bias
+            else:
+                return super().cast_bias_weight(*args, **kwargs)
 
         def forward_ggml_cast_weights(self, input):
             weight, bias = self.cast_bias_weight(input)
